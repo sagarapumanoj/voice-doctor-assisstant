@@ -1,115 +1,272 @@
+
 """Tools the voice agent can call: availability, booking, cancellation."""
 
 import logging
+import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import db
 
 log = logging.getLogger("tools")
 
+CLINIC_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
-# ---------- helpers ----------
+
+# --------------------------------------------------
+# 1. Helpers
+# --------------------------------------------------
+
+def normalize_phone(phone_number: str) -> str | None:
+    """Normalize and validate an Indian 10-digit phone number."""
+
+    if not isinstance(phone_number, str):
+        return None
+
+    digits = re.sub(r"\D", "", phone_number)
+
+    # Accept either 10 digits or 91 + 10 digits.
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+
+    if not re.fullmatch(r"[6-9]\d{9}", digits):
+        return None
+
+    return digits
+
 
 def speakable_time(start_time: str) -> str:
-    """'2026-11-25 10:30' -> 'Wednesday, 25 November at 10:30 AM'"""
+    """Convert database time into natural spoken time."""
+
     dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M")
+
     hour = dt.hour % 12 or 12
-    return f"{dt.strftime('%A')}, {dt.day} {dt.strftime('%B')} at {hour}:{dt.minute:02d} {dt.strftime('%p')}"
+
+    return (
+        f"{dt.strftime('%A')}, "
+        f"{dt.day} {dt.strftime('%B')} "
+        f"at {hour}:{dt.minute:02d} "
+        f"{dt.strftime('%p')}"
+    )
 
 
-def _valid_date(value: str) -> bool:
+def valid_date(value: str) -> bool:
+    """Validate YYYY-MM-DD and reject past dates."""
+
+    if not isinstance(value, str):
+        return False
+
     try:
-        datetime.strptime(value, "%Y-%m-%d")
-        return True
-    except (ValueError, TypeError):
+        requested = datetime.strptime(value, "%Y-%m-%d").date()
+        today = datetime.now(CLINIC_TIMEZONE).date()
+
+        return requested >= today
+
+    except ValueError:
         return False
 
 
-# ---------- core tool logic (plain functions, easy to test) ----------
+def valid_name(name: str) -> bool:
+    if not isinstance(name, str):
+        return False
 
-def check_doctor_availability(doctor_name: str | None = None,
-                              date: str | None = None) -> dict:
+    name = name.strip()
+
+    return (
+        1 <= len(name) <= 100
+        and any(char.isalpha() for char in name)
+    )
+
+
+# --------------------------------------------------
+# 2. Check doctor availability
+# --------------------------------------------------
+
+def check_doctor_availability(
+    doctor_name: str | None = None,
+    date: str | None = None,
+) -> dict:
+
     doctor_id = None
-    doctor = None
 
-    if doctor_name:
-        doctor = db.find_doctor(doctor_name)
+    if doctor_name is not None:
+        if not isinstance(doctor_name, str) or not doctor_name.strip():
+            return {
+                "success": False,
+                "reason": "invalid_doctor_name",
+            }
+
+        doctor = db.find_doctor(doctor_name.strip())
+
         if not doctor:
             return {
                 "success": False,
                 "reason": "doctor_not_found",
-                "available_doctors": [d["name"] for d in db.list_doctors()],
+                "available_doctors": [
+                    d["name"] for d in db.list_doctors()
+                ],
             }
+
         doctor_id = doctor["id"]
 
-    if date and not _valid_date(date):
-        return {"success": False, "reason": "invalid_date",
-                "hint": "Date must be in YYYY-MM-DD format."}
+    if date is not None and not valid_date(date):
+        return {
+            "success": False,
+            "reason": "invalid_or_past_date",
+            "hint": "Provide a current or future date in YYYY-MM-DD format.",
+        }
 
-    slots = db.get_available_slots(doctor_id=doctor_id, date=date)
+    slots = db.get_available_slots(
+        doctor_id=doctor_id,
+        date=date,
+    )
+
     if not slots:
-        return {"success": True, "slots": [],
-                "message": "No open slots for that request."}
+        return {
+            "success": True,
+            "slots": [],
+            "message": "No open slots for that request.",
+        }
+
+    available_slots = []
+
+    for slot in slots:
+        available_slots.append({
+            "slot_id": slot["slot_id"],
+            "doctor": slot["doctor"],
+            "specialty": slot["specialty"],
+            "when": speakable_time(slot["start_time"]),
+        })
 
     return {
         "success": True,
-        "slots": [
-            {
-                "slot_id": s["slot_id"],
-                "doctor": s["doctor"],
-                "specialty": s["specialty"],
-                "when": speakable_time(s["start_time"]),
-            }
-            for s in slots
-        ],
+        "slots": available_slots,
     }
 
 
-def book_appointment(slot_id: int, phone_number: str, patient_name: str,
-                     number_confirmed_by_caller: bool = False) -> dict:
-    # Enforced in code: the model cannot skip the read-back step.
-    if number_confirmed_by_caller is not True:
-        return {"success": False, "reason": "number_not_confirmed",
-                "hint": "Read the number back digit by digit and get a yes first."}
-    if not patient_name or not patient_name.strip():
-        return {"success": False, "reason": "missing_name"}
+# --------------------------------------------------
+# 3. Book appointment
+# --------------------------------------------------
 
-    result = db.book_slot(int(slot_id), phone_number, patient_name)
-    if result["success"]:
+def book_appointment(
+    slot_id: int,
+    phone_number: str,
+    patient_name: str,
+    number_confirmed_by_caller: bool = False,
+) -> dict:
+
+    # Validate confirmation.
+    if number_confirmed_by_caller is not True:
+        return {
+            "success": False,
+            "reason": "number_not_confirmed",
+        }
+
+    # Validate phone.
+    phone = normalize_phone(phone_number)
+
+    if not phone:
+        return {
+            "success": False,
+            "reason": "invalid_phone_number",
+            "hint": "A valid 10-digit Indian mobile number is required.",
+        }
+
+    # Validate patient name.
+    if not valid_name(patient_name):
+        return {
+            "success": False,
+            "reason": "invalid_patient_name",
+        }
+
+    # Validate slot ID.
+    if isinstance(slot_id, bool):
+        return {
+            "success": False,
+            "reason": "invalid_slot_id",
+        }
+
+    try:
+        slot_id = int(slot_id)
+
+        if slot_id <= 0:
+            raise ValueError("Invalid slot ID")
+
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "reason": "invalid_slot_id",
+        }
+
+    # Perform database booking.
+    result = db.book_slot(
+        slot_id,
+        phone,
+        patient_name.strip(),
+    )
+
+    if result.get("success"):
         result["when"] = speakable_time(result["start_time"])
+
     return result
 
 
-def cancel_appointment(phone_number: str,
-                       number_confirmed_by_caller: bool = False) -> dict:
-    if number_confirmed_by_caller is not True:
-        return {"success": False, "reason": "number_not_confirmed",
-                "hint": "Read the number back digit by digit and get a yes first."}
+# --------------------------------------------------
+# 4. Cancel appointment
+# --------------------------------------------------
 
-    result = db.cancel_by_phone(phone_number)
-    if result["success"]:
+def cancel_appointment(
+    phone_number: str,
+    number_confirmed_by_caller: bool = False,
+) -> dict:
+
+    if number_confirmed_by_caller is not True:
+        return {
+            "success": False,
+            "reason": "number_not_confirmed",
+        }
+
+    phone = normalize_phone(phone_number)
+
+    if not phone:
+        return {
+            "success": False,
+            "reason": "invalid_phone_number",
+        }
+
+    result = db.cancel_by_phone(phone)
+
+    if result.get("success"):
         result["when"] = speakable_time(result["start_time"])
+
     return result
 
 
-# ---------- Pipecat wiring ----------
+# --------------------------------------------------
+# 5. Pipecat tool schemas
+# --------------------------------------------------
 
 def build_tools_schema():
-    """Tool definitions the LLM sees. Imported lazily so tests don't need Pipecat."""
+
     from pipecat.adapters.schemas.function_schema import FunctionSchema
     from pipecat.adapters.schemas.tools_schema import ToolsSchema
 
     check = FunctionSchema(
         name="check_doctor_availability",
         description=(
-            "List open appointment slots. Optionally filter by doctor name "
-            "and/or date. Always call this before offering any time to the caller."
+            "Check actual doctor appointment availability. "
+            "Always call before suggesting appointment times. "
+            "Never invent slot IDs or availability."
         ),
         properties={
-            "doctor_name": {"type": "string",
-                            "description": "Doctor's name, e.g. 'Sharma'. Optional."},
-            "date": {"type": "string",
-                     "description": "Date in YYYY-MM-DD format. Optional."},
+            "doctor_name": {
+                "type": "string",
+                "description": "Doctor name. Optional.",
+            },
+            "date": {
+                "type": "string",
+                "description": "Appointment date in YYYY-MM-DD format. Optional.",
+            },
         },
         required=[],
     )
@@ -117,54 +274,98 @@ def build_tools_schema():
     book = FunctionSchema(
         name="book_appointment",
         description=(
-            "Book a slot for the caller. Only call after the caller has chosen "
-            "a slot AND confirmed their phone number after you read it back."
+            "Book an available appointment slot. "
+            "Only call after the caller has selected the slot, "
+            "provided their name, and confirmed their phone number."
         ),
         properties={
-            "slot_id": {"type": "integer",
-                        "description": "slot_id from check_doctor_availability."},
-            "phone_number": {"type": "string",
-                             "description": "Caller's phone number, digits only."},
-            "patient_name": {"type": "string",
-                             "description": "Caller's name."},
+            "slot_id": {
+                "type": "integer",
+                "description": "Exact slot_id from availability results.",
+            },
+            "phone_number": {
+                "type": "string",
+                "description": "Confirmed 10-digit caller phone number.",
+            },
+            "patient_name": {
+                "type": "string",
+                "description": "Patient's full name.",
+            },
             "number_confirmed_by_caller": {
                 "type": "boolean",
-                "description": "True ONLY if you read the number back digit by "
-                               "digit and the caller said yes."},
+                "description": "True only after explicit caller confirmation.",
+            },
         },
-        required=["slot_id", "phone_number", "patient_name",
-                  "number_confirmed_by_caller"],
+        required=[
+            "slot_id",
+            "phone_number",
+            "patient_name",
+            "number_confirmed_by_caller",
+        ],
     )
 
     cancel = FunctionSchema(
         name="cancel_appointment",
         description=(
-            "Cancel the caller's existing appointment, found by phone number. "
-            "Only call after the caller confirmed the number you read back."
+            "Cancel an existing appointment associated with "
+            "the caller's confirmed phone number."
         ),
         properties={
-            "phone_number": {"type": "string",
-                             "description": "Caller's phone number, digits only."},
+            "phone_number": {
+                "type": "string",
+                "description": "Confirmed 10-digit phone number.",
+            },
             "number_confirmed_by_caller": {
                 "type": "boolean",
-                "description": "True ONLY if you read the number back digit by "
-                               "digit and the caller said yes."},
+                "description": "True only after explicit confirmation.",
+            },
         },
-        required=["phone_number", "number_confirmed_by_caller"],
+        required=[
+            "phone_number",
+            "number_confirmed_by_caller",
+        ],
     )
 
-    return ToolsSchema(standard_tools=[check, book, cancel])
+    return ToolsSchema(
+        standard_tools=[
+            check,
+            book,
+            cancel,
+        ]
+    )
 
+
+# --------------------------------------------------
+# 6. Tool handlers
+# --------------------------------------------------
 
 async def _check_handler(params):
+
     args = params.arguments
-    result = check_doctor_availability(args.get("doctor_name"), args.get("date"))
-    log.info("check_doctor_availability(%s) -> %s", args, result)
+
+    try:
+        result = check_doctor_availability(
+            args.get("doctor_name"),
+            args.get("date"),
+        )
+
+    except Exception:
+        log.exception("Availability check failed")
+        result = {
+            "success": False,
+            "reason": "internal_error",
+        }
+
+    log.info("Availability check completed: success=%s",
+             result.get("success"))
+
     await params.result_callback(result)
 
 
 async def _book_handler(params):
+
     args = params.arguments
+
     try:
         result = book_appointment(
             args.get("slot_id"),
@@ -172,24 +373,66 @@ async def _book_handler(params):
             args.get("patient_name", ""),
             args.get("number_confirmed_by_caller", False),
         )
-    except (TypeError, ValueError):
-        result = {"success": False, "reason": "invalid_slot_id"}
-    log.info("book_appointment(%s) -> %s", args, result)
+
+    except Exception:
+        log.exception("Appointment booking failed")
+        result = {
+            "success": False,
+            "reason": "internal_error",
+        }
+
+    log.info(
+        "Booking operation completed: success=%s",
+        result.get("success"),
+    )
+
     await params.result_callback(result)
 
 
 async def _cancel_handler(params):
+
     args = params.arguments
-    result = cancel_appointment(
-        args.get("phone_number", ""),
-        args.get("number_confirmed_by_caller", False),
+
+    try:
+        result = cancel_appointment(
+            args.get("phone_number", ""),
+            args.get("number_confirmed_by_caller", False),
+        )
+
+    except Exception:
+        log.exception("Appointment cancellation failed")
+        result = {
+            "success": False,
+            "reason": "internal_error",
+        }
+
+    log.info(
+        "Cancellation operation completed: success=%s",
+        result.get("success"),
     )
-    log.info("cancel_appointment(%s) -> %s", args, result)
+
     await params.result_callback(result)
 
 
-def register_tools(llm) -> None:
-    """Attach the handlers to the LLM service inside the pipeline."""
-    llm.register_function("check_doctor_availability", _check_handler)
-    llm.register_function("book_appointment", _book_handler)
-    llm.register_function("cancel_appointment", _cancel_handler)
+# --------------------------------------------------
+# 7. Register tools with LLM
+# --------------------------------------------------
+
+def register_tools(llm):
+
+    llm.register_function(
+        "check_doctor_availability",
+        _check_handler,
+    )
+
+    llm.register_function(
+        "book_appointment",
+        _book_handler,
+    )
+
+    llm.register_function(
+        "cancel_appointment",
+        _cancel_handler,
+    )
+
+    log.info("Appointment tools registered successfully.")
