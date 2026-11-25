@@ -1,4 +1,4 @@
-"""Pipecat voice agent: ElevenLabs STT -> Gemini -> ElevenLabs TTS, with tools."""
+"""Pipecat voice agent: ElevenLabs STT -> Groq LLM -> ElevenLabs TTS, with tools."""
 
 import sys
 
@@ -11,6 +11,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 import os
+import re
 from datetime import date
 
 import aiohttp
@@ -18,7 +19,8 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import LLMRunFrame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -27,9 +29,10 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.services.elevenlabs.stt import ElevenLabsSTTService
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService
 from pipecat.services.google.llm import GoogleLLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
@@ -71,6 +74,39 @@ confirmed, read it back again.
 Start by greeting the caller briefly and asking how you can help."""
 
 
+class NoiseTagFilter(FrameProcessor):
+    """Drops STT sound tags like [background noise] or (clears throat)."""
+
+    async def process_frame(self, frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            cleaned = re.sub(r"[\[\(][^\]\)]*[\]\)]", "", frame.text).strip()
+            if not cleaned:
+                return  # only a sound tag, so don't pass it on
+            frame.text = cleaned
+        await self.push_frame(frame, direction)
+
+
+def build_llm():
+    """Groq by default (fast, free tier). Set LLM_PROVIDER=gemini to use Gemini."""
+    if os.getenv("LLM_PROVIDER", "groq") == "groq":
+        from pipecat.services.openai.llm import OpenAILLMService
+
+        return OpenAILLMService(
+            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://api.groq.com/openai/v1",
+            settings=OpenAILLMService.Settings(
+                model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+            ),
+        )
+    return GoogleLLMService(
+        api_key=os.environ["GOOGLE_API_KEY"],
+        settings=GoogleLLMService.Settings(
+            model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+        ),
+    )
+
+
 async def run_bot(transport: SmallWebRTCTransport) -> None:
     session = aiohttp.ClientSession()
 
@@ -78,18 +114,15 @@ async def run_bot(transport: SmallWebRTCTransport) -> None:
         api_key=os.environ["ELEVENLABS_API_KEY"],
         aiohttp_session=session,
     )
+    noise_filter = NoiseTagFilter()
 
-    llm = GoogleLLMService(
-        api_key=os.environ["GOOGLE_API_KEY"],
-        settings=GoogleLLMService.Settings(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        ),
-    )
+    llm = build_llm()
     tools.register_tools(llm)
 
-    tts = ElevenLabsTTSService(
+    tts = ElevenLabsHttpTTSService(
         api_key=os.environ["ELEVENLABS_API_KEY"],
-        settings=ElevenLabsTTSService.Settings(
+        aiohttp_session=session,
+        settings=ElevenLabsHttpTTSService.Settings(
             voice=os.environ["ELEVENLABS_VOICE_ID"],
             model="eleven_flash_v2_5",
         ),
@@ -104,14 +137,19 @@ async def run_bot(transport: SmallWebRTCTransport) -> None:
     )
     user_agg, assistant_agg = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(confidence=0.85, start_secs=0.4, min_volume=0.6)
+            ),
+        ),
     )
 
     pipeline = Pipeline([
         transport.input(),   # caller audio in
         stt,                 # audio -> text
+        noise_filter,        # drop [background noise]-style tags
         user_agg,            # collects the user's turn into the context
-        llm,                 # Gemini, calls tools when needed
+        llm,                 # LLM, calls tools when needed
         tts,                 # text -> audio
         transport.output(),  # bot audio out
         assistant_agg,       # saves bot replies and tool results to the context
